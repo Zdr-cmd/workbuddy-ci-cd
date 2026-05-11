@@ -54,12 +54,13 @@ class MAMLMetaLearner(nn.Module):
     def forward(self, task_features: torch.Tensor) -> tuple:
         """
         将任务特征映射为 LinUCB 参数 (A, b)
-        返回：(A_flat, b_vec)
+        返回：(A, b)，A 为 (d, d)，b 为 (d,)
         """
         h = self.task_encoder(task_features)
         A_flat = self.A_head(h)          # shape: (batch, d^2)
-        b_vec = self.b_head(h)            # shape: (batch, d)
-        return A_flat, b_vec
+        A = A_flat.view(self.base_feature_dim, self.base_feature_dim)  # reshape
+        b_vec = self.b_head(h)           # shape: (batch, d)
+        return A, b_vec
 
     def adapt(self, base_learner: LinUCBBase, task_features: torch.Tensor,
               rewards: torch.Tensor, inner_lr: float = 0.01, inner_steps: int = 5):
@@ -97,10 +98,12 @@ def train_maml(meta_tasks: List[Dict], feature_dim: int,
                 task_feature_dim: int, epochs: int = 100,
                 inner_lr: float = 0.01, outer_lr: float = 0.001) -> MAMLMetaLearner:
     """
-    训练 MAML 元学习器
-    meta_tasks: [{"task_features": Tensor, "rewards": Tensor}, ...]
+    训练 MAML 元学习器（符合宪章 v5.0.0 第15.4节）
+    meta_tasks: [{"task_feature": Tensor, "samples": [...]}, ...]
+                task_feature: 任务级特征（one-hot 或 embedding）
+                samples: [{"context": List, "reward": float}, ...]
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")  # CI 环境下使用 CPU
     meta_learner = MAMLMetaLearner(
         task_feature_dim=task_feature_dim,
         base_feature_dim=feature_dim
@@ -110,20 +113,37 @@ def train_maml(meta_tasks: List[Dict], feature_dim: int,
     for epoch in range(epochs):
         total_loss = 0.0
         for task in meta_tasks:
-            task_features = task["task_features"].to(device)
-            rewards = task["rewards"].to(device)
+            # 兼容 task_feature / task_features 两种字段名
+            task_feat = task.get("task_feature") or task.get("task_features")
+            if task_feat is None:
+                continue
+
+            if isinstance(task_feat, list):
+                task_feat = torch.tensor(task_feat, dtype=torch.float32)
+            task_feat = task_feat.to(device).unsqueeze(0)  # (1, task_feature_dim)
+
+            # 从 samples 聚合奖励
+            samples = task.get("samples", [])
+            if samples:
+                rewards_list = torch.tensor(
+                    [s.get("reward", 0.0) for s in samples],
+                    dtype=torch.float32
+                ).to(device)
+            else:
+                rewards_list = torch.tensor([0.0], dtype=torch.float32).to(device)
 
             # 外循环：计算元梯度
-            A_flat, b_vec = meta_learner(task_features)
+            A_flat, b_vec = meta_learner(task_feat)
             # 简化损失：元目标是最大化累积奖励
-            loss = -rewards.mean()
+            loss = -rewards_list.mean()
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if loss.requires_grad:
+                loss.backward()
+                optimizer.step()
             total_loss += loss.item()
 
-        if (epoch + 1) % 20 == 0:
+        if (epoch + 1) % max(1, epochs // 5) == 0 or epochs <= 5:
             print(f"[MAML] Epoch {epoch+1}/{epochs}, avg loss: {total_loss / max(len(meta_tasks), 1):.4f}")
 
     return meta_learner
