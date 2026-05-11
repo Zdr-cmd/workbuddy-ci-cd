@@ -10,7 +10,7 @@ import json
 import os
 import shutil
 from datetime import datetime, timedelta
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 
 # 全局状态
 _evolution_frozen = False
@@ -201,3 +201,66 @@ def rollback_to_version(target_version: str) -> Tuple[bool, str]:
         return True, f"已回滚到 {target_version}"
     except Exception as e:
         return False, str(e)
+
+
+# ========== 在线学习接口（增量训练） ==========
+_linucb_router: Optional[Any] = None  # 全局 LinUCB 路由器引用
+_config: Optional[Dict[str, Any]] = None
+
+
+def register_linucb_router(router: Any, config: Optional[Dict[str, Any]] = None):
+    """注册 LinUCB 路由器实例，供 incremental_train 使用"""
+    global _linucb_router, _config
+    _linucb_router = router
+    _config = config or {}
+
+
+def incremental_train(model_id: str, new_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    增量更新模型参数（在线学习）
+    符合宪章 v5.0.0 第14章在线学习进化要求
+    """
+    global _linucb_router, _config
+
+    if model_id == "bandit":
+        if _linucb_router is None:
+            # 尝试懒加载
+            try:
+                from core.linucb_router import LinUCBRouter
+                cfg = _config or {}
+                _linucb_router = LinUCBRouter(
+                    redis_url=cfg.get("redis_url"),
+                    feature_dim=cfg.get("feature_dim", 12)
+                )
+            except Exception:
+                return {"error": "LinUCB router not initialized"}
+        context = new_data.get("context", {})
+        reward = float(new_data.get("reward", 0.0))
+        model_name = new_data.get("model", "hy3")
+        try:
+            _linucb_router.update(model_name, context, reward)
+            return {"status": "updated", "model": "bandit", "reward": reward}
+        except Exception as e:
+            return {"error": str(e), "model": "bandit"}
+
+    elif model_id == "weighted":
+        try:
+            from core.model_router import WeightedModelRouter
+            cfg = _config or {}
+            router = WeightedModelRouter(config=cfg)
+            router.update_stats(
+                model=new_data.get("model", "hy3"),
+                task_type=new_data.get("task_type", "default"),
+                success=new_data.get("success", True),
+                cost=float(new_data.get("cost", 0.0)),
+                latency=float(new_data.get("latency", 0.0))
+            )
+            return {"status": "updated", "model": "weighted"}
+        except ImportError:
+            return {"error": "WeightedModelRouter not available"}
+        except Exception as e:
+            return {"error": str(e), "model": "weighted"}
+
+    else:
+        return {"error": f"Unknown model_id: {model_id}"}
+
